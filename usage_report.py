@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""GenAI gateway usage report — key/team budgets + per-user spend this cycle.
+"""GenAI gateway usage report.
+
+SPEND section        -> this user's cycle spend + lifetime spend
+TEAM BUDGETS section -> each team's budget, usage %, and cycle period
 
 Usage:
     python3 usage_report.py sk-your-api-key
@@ -18,7 +21,6 @@ GATEWAY = os.environ.get("GATEWAY", "https://gateway.aws.genai.umbc.edu")
 
 # ----------------------------- HTTP helper -----------------------------
 def api_get(path, token):
-    """GET a gateway endpoint; return parsed JSON, or {'_error': ...} on failure."""
     req = urllib.request.Request(f"{GATEWAY}{path}",
                                  headers={"Authorization": f"Bearer {token}"})
     try:
@@ -42,7 +44,6 @@ def money2(v):
 
 
 def to_dt(s):
-    """Parse an epoch number or ISO string into an aware UTC datetime, or None."""
     if s is None:
         return None
     if isinstance(s, (int, float)):
@@ -56,7 +57,6 @@ def to_dt(s):
 
 
 def parse_duration(d):
-    """'7d'/'24h'/'30m' -> timedelta, or None."""
     if not d:
         return None
     try:
@@ -68,7 +68,6 @@ def parse_duration(d):
 
 
 def time_until(reset_raw):
-    """Return 'Xd Yh' / 'Yh Zm' / 'Zm' until reset, or None."""
     target = to_dt(reset_raw)
     if target is None:
         return None
@@ -84,7 +83,6 @@ def time_until(reset_raw):
 
 
 def cycle_start(reset_raw, duration):
-    """Start of the current budget cycle = reset_at - duration."""
     end = to_dt(reset_raw)
     dur = parse_duration(duration)
     if end and dur:
@@ -94,10 +92,8 @@ def cycle_start(reset_raw, duration):
 
 # ------------------- per-user spend within a team (cycle) -------------------
 def user_team_cycle_spend(token, uid, team_id, since_dt):
-    """Sum this user's spend in a team since `since_dt`, from /spend/logs.
-
-    Returns a float, or None if logs are unavailable / unauthorized.
-    """
+    """Sum this user's spend in a team since `since_dt` (None = all time).
+    Returns float, or None if logs unavailable/unauthorized."""
     logs = api_get(f"/spend/logs?user_id={uid}", token)
     if isinstance(logs, dict) and "_error" in logs:
         return None
@@ -105,7 +101,6 @@ def user_team_cycle_spend(token, uid, team_id, since_dt):
     if not isinstance(rows, list):
         return None
     total = 0.0
-    found = False
     for r in rows:
         if not isinstance(r, dict):
             continue
@@ -115,8 +110,7 @@ def user_team_cycle_spend(token, uid, team_id, since_dt):
         if since_dt and ts and ts < since_dt:
             continue
         total += r.get("spend", 0) or 0
-        found = True
-    return total if found else 0.0
+    return total
 
 
 # ------------------------------- main -------------------------------
@@ -142,11 +136,14 @@ def main():
         tr = api_get(f"/team/info?team_id={key_team_id}", api_key)
         team = tr.get("team_info", tr) if "_error" not in tr else {}
 
-    # ---- user info (all team memberships) ----
+    # ---- user info (all team memberships + lifetime spend) ----
     user = {}
     if uid:
         ur = api_get(f"/user/info?user_id={uid}", api_key)
         user = ur if "_error" not in ur else {}
+    user_info = user.get("user_info", user)
+    lifetime_spend = user_info.get("spend")
+    created_at = user_info.get("created_at") or info.get("created_at")
 
     # ---- enumerate all the user's teams ----
     team_ids = set()
@@ -155,6 +152,8 @@ def main():
             tid = t.get("team_id") if isinstance(t, dict) else t
             if tid:
                 team_ids.add(tid)
+    if key_team_id:
+        team_ids.add(key_team_id)
     teams = []
     for tid in sorted(team_ids):
         tr = api_get(f"/team/info?team_id={tid}", api_key)
@@ -162,72 +161,66 @@ def main():
         obj["resolved_team_id"] = tid
         teams.append(obj)
 
-    # ---- resolve governing budget: key first, else its team ----
-    if info.get("max_budget") is not None:
-        budget, spend, src = info["max_budget"], info.get("spend") or 0, "key"
-        reset_raw, cycle = info.get("budget_reset_at"), info.get("budget_duration")
-    elif team.get("max_budget") is not None:
-        budget, spend, src = team["max_budget"], team.get("spend") or 0, "team"
-        reset_raw, cycle = team.get("budget_reset_at"), team.get("budget_duration")
-    else:
-        budget, spend, src = None, info.get("spend") or 0, None
-        reset_raw, cycle = None, None
+    # ---- this user's cycle spend in the governing team (for SPEND section) ----
+    my_cycle_spend = None
+    gov_budget = team.get("max_budget")
+    if key_team_id:
+        since = cycle_start(team.get("budget_reset_at"), team.get("budget_duration"))
+        my_cycle_spend = user_team_cycle_spend(api_key, uid, key_team_id, since)
 
-    tleft = time_until(reset_raw)
     models = info.get("models") or []
 
-    # ---- this user's spend in the governing team, this cycle ----
-    my_share = None
-    if src == "team":
-        since = cycle_start(reset_raw, cycle)
-        my_share = user_team_cycle_spend(api_key, uid, key_team_id, since)
-
-    # ----------------------------- render -----------------------------
+    # ============================ render ============================
     line = "=" * 55
     print(line)
     print("            GenAI Gateway — API Key Usage Report")
     print(line)
     print(f"Key alias      : {info.get('key_alias') or '—'}")
-    print(f"User / Owner   : {info.get('user_id') or '—'}")
+    print(f"User           : {info.get('user_id') or '—'}")
     print(f"Team           : {info.get('team_id') or '—'}")
-    print()
-    print("---------------------- SPEND --------------------------")
-    print(f"Spent          : {money(spend)}")
-    if budget is None:
-        print("Budget (max)   : unlimited")
-        print("Remaining      : unlimited")
-        print("Usage          : —")
-    else:
-        tag = " (team)" if src == "team" else ""
-        print(f"Budget (max)   : ${budget}{tag}")
-        print(f"Remaining      : {money(budget - spend)}")
-        print(f"Usage          : {(spend / budget * 100) if budget else 0:.1f}%")
-    if cycle:
-        print(f"Budget cycle   : {cycle}")
-    if reset_raw:
-        suffix = f" (in {tleft})" if tleft else ""
-        print(f"Budget resets  : {reset_raw}{suffix}")
-    if src == "team" and my_share is not None:
-        share_pct = f" ({my_share / budget * 100:.1f}% of team budget)" if budget else ""
-        print(f"Your spend     : {money(my_share)}{share_pct}  [this cycle]")
     print(f"Models allowed : {'all' if not models else ', '.join(models)}")
+    print()
 
-    # ---- per-team breakdown for multi-team users ----
-    if len(teams) > 1:
-        print()
-        print("------------------ TEAM BUDGETS -----------------------")
-        for t in teams:
-            tid = t.get("resolved_team_id")
-            name = t.get("team_alias") or tid or "—"
-            if t.get("max_budget") is not None:
-                budget_str = f"team {money2(t.get('spend'))}/${t['max_budget']}"
-            else:
-                budget_str = f"team {money2(t.get('spend'))} (no budget)"
-            since = cycle_start(t.get("budget_reset_at"), t.get("budget_duration"))
-            mine = user_team_cycle_spend(api_key, uid, tid, since)
-            you = f", you {money2(mine)} this cycle" if mine is not None else ""
-            gov = "   ← governs this key" if tid == key_team_id else ""
-            print(f"  • {name}: {budget_str}{you}{gov}")
+    # ---------------- SPEND: this user's numbers ----------------
+    print("------------------------ SPEND ------------------------")
+    if my_cycle_spend is not None:
+        pct = f" ({my_cycle_spend / gov_budget * 100:.1f}% of team budget)" if gov_budget else ""
+        print(f"Cycle spend    : {money(my_cycle_spend)}{pct}")
+    else:
+        # fall back to the key/governing spend if logs unavailable
+        fallback = info.get("spend") if info.get("max_budget") is not None else team.get("spend")
+        print(f"Cycle spend    : {money(fallback)}")
+    if lifetime_spend is not None:
+        since_str = f" (since {str(created_at)[:10]})" if created_at else ""
+        print(f"Lifetime spend : {money(lifetime_spend)}{since_str}")
+    print()
+
+    # ---------------- TEAM BUDGETS: the team's numbers ----------------
+    print("--------------------- TEAM BUDGETS --------------------")
+    if not teams:
+        print("  (no team budgets — usage is key- or user-managed)")
+    for t in teams:
+        tid = t.get("resolved_team_id")
+        name = t.get("team_alias") or tid or "—"
+        tbudget = t.get("max_budget")
+        tspend = t.get("spend") or 0
+        gov = "  ← governs this key" if tid == key_team_id else ""
+        print(f"  • {name}{gov}")
+        if tbudget is not None:
+            tpct = (tspend / tbudget * 100) if tbudget else 0
+            print(f"      Budget       : ${tbudget}")
+            print(f"      Team usage   : {money2(tspend)} ({tpct:.1f}%)")
+        else:
+            print(f"      Budget       : unlimited")
+            print(f"      Team usage   : {money2(tspend)}")
+        cyc = t.get("budget_duration")
+        reset = t.get("budget_reset_at")
+        if cyc or reset:
+            tleft = time_until(reset)
+            cyc_str = cyc or "—"
+            reset_str = f"{reset}" + (f" (in {tleft})" if tleft else "") if reset else "—"
+            print(f"      Cycle period : {cyc_str}")
+            print(f"      Resets       : {reset_str}")
     print()
     print(line)
 
