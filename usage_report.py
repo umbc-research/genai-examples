@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GenAI gateway usage report."""
+"""GenAI gateway usage report"""
 import json
 import os
 import sys
