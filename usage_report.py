@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """GenAI gateway usage report.
 
-SPEND section        -> this user's cycle spend + lifetime spend
+SPEND section        -> this user's cycle spend (% of team budget) + lifetime spend
 TEAM BUDGETS section -> each team's budget, usage %, and cycle period
+
+Cycle spend and lifetime spend are both derived from a SINGLE /spend/logs fetch,
+so lifetime (all teams, all time) is always >= cycle (governing team, this cycle).
+Falls back to the cached /user/info counter if the logs endpoint is unavailable
+or times out.
 
 Usage:
     python3 usage_report.py sk-your-api-key
@@ -10,6 +15,7 @@ Usage:
 """
 import json
 import os
+import socket
 import sys
 import time
 import urllib.request
@@ -20,21 +26,21 @@ GATEWAY = os.environ.get("GATEWAY", "https://gateway.aws.genai.umbc.edu")
 
 
 # ----------------------------- HTTP helper -----------------------------
-def api_get(path, token):
+def api_get(path, token, timeout=15):
     req = urllib.request.Request(f"{GATEWAY}{path}",
                                  headers={"Authorization": f"Bearer {token}"})
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         return {"_error": f"HTTP {e.code}: {e.read().decode()[:200]}"}
-    except urllib.error.URLError as e:
-        return {"_error": f"Connection error: {e.reason}"}
+    except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+        return {"_error": f"timeout/connection error: {e}"}
     except json.JSONDecodeError:
         return {"_error": "non-JSON response"}
 
 
-# ----------------------------- formatting -----------------------------
+# ----------------------------- formatting helpers -----------------------------
 def money(v):
     return f"${(v or 0):.4f}"
 
@@ -44,6 +50,7 @@ def money2(v):
 
 
 def to_dt(s):
+    """Parse epoch number or ISO string -> aware UTC datetime, or None."""
     if s is None:
         return None
     if isinstance(s, (int, float)):
@@ -57,6 +64,7 @@ def to_dt(s):
 
 
 def parse_duration(d):
+    """'7d'/'24h'/'30m' -> timedelta, or None."""
     if not d:
         return None
     try:
@@ -68,6 +76,7 @@ def parse_duration(d):
 
 
 def time_until(reset_raw):
+    """'Xd Yh' / 'Yh Zm' / 'Zm' until reset, or None."""
     target = to_dt(reset_raw)
     if target is None:
         return None
@@ -83,6 +92,7 @@ def time_until(reset_raw):
 
 
 def cycle_start(reset_raw, duration):
+    """Start of current budget cycle = reset_at - duration, or None."""
     end = to_dt(reset_raw)
     dur = parse_duration(duration)
     if end and dur:
@@ -90,21 +100,26 @@ def cycle_start(reset_raw, duration):
     return None
 
 
-# ------------------- per-user spend within a team (cycle) -------------------
-def user_team_cycle_spend(token, uid, team_id, since_dt):
-    """Sum this user's spend in a team since `since_dt` (None = all time).
-    Returns float, or None if logs unavailable/unauthorized."""
-    logs = api_get(f"/spend/logs?user_id={uid}", token)
-    if isinstance(logs, dict) and "_error" in logs:
-        return None
-    rows = logs if isinstance(logs, list) else logs.get("data", logs.get("logs", []))
+# ----------------------------- spend from logs -----------------------------
+def fetch_user_logs(token, uid):
+    """Fetch this user's spend-log rows (single request). Returns (rows, ok).
+       ok=False if the endpoint is unavailable/denied/times out."""
+    resp = api_get(f"/spend/logs?user_id={uid}", token)
+    if isinstance(resp, dict) and "_error" in resp:
+        return [], False
+    rows = resp if isinstance(resp, list) else resp.get("data", resp.get("logs", []))
     if not isinstance(rows, list):
-        return None
+        return [], False
+    return rows, True
+
+
+def sum_logs(rows, team_id=None, since_dt=None):
+    """Sum spend in rows, optionally filtered by team_id and/or since_dt."""
     total = 0.0
     for r in rows:
         if not isinstance(r, dict):
             continue
-        if team_id and r.get("team_id") not in (team_id, None):
+        if team_id is not None and r.get("team_id") != team_id:
             continue
         ts = to_dt(r.get("startTime") or r.get("created_at") or r.get("timestamp"))
         if since_dt and ts and ts < since_dt:
@@ -135,14 +150,15 @@ def main():
     if key_team_id:
         tr = api_get(f"/team/info?team_id={key_team_id}", api_key)
         team = tr.get("team_info", tr) if "_error" not in tr else {}
+    gov_budget = team.get("max_budget")
 
-    # ---- user info (all team memberships + lifetime spend) ----
+    # ---- user info (team memberships + cached lifetime fallback) ----
     user = {}
     if uid:
         ur = api_get(f"/user/info?user_id={uid}", api_key)
         user = ur if "_error" not in ur else {}
     user_info = user.get("user_info", user)
-    lifetime_spend = user_info.get("spend")
+    cached_lifetime = user_info.get("spend")
     created_at = user_info.get("created_at") or info.get("created_at")
 
     # ---- enumerate all the user's teams ----
@@ -161,12 +177,19 @@ def main():
         obj["resolved_team_id"] = tid
         teams.append(obj)
 
-    # ---- this user's cycle spend in the governing team (for SPEND section) ----
-    my_cycle_spend = None
-    gov_budget = team.get("max_budget")
-    if key_team_id:
-        since = cycle_start(team.get("budget_reset_at"), team.get("budget_duration"))
-        my_cycle_spend = user_team_cycle_spend(api_key, uid, key_team_id, since)
+    # ---- logs: ONE fetch, derive BOTH (lifetime >= cycle guaranteed) ----
+    if uid:
+        log_rows, logs_ok = fetch_user_logs(api_key, uid)
+    else:
+        log_rows, logs_ok = [], False
+
+    if logs_ok:
+        since = cycle_start(team.get("budget_reset_at"), team.get("budget_duration")) if key_team_id else None
+        my_cycle_spend = sum_logs(log_rows, team_id=key_team_id, since_dt=since)  # this team, this cycle
+        lifetime_spend = sum_logs(log_rows, team_id=None, since_dt=None)          # all teams, all time
+    else:
+        my_cycle_spend = None
+        lifetime_spend = cached_lifetime   # fallback if logs unavailable/timeout
 
     models = info.get("models") or []
 
@@ -176,18 +199,17 @@ def main():
     print("            GenAI Gateway — API Key Usage Report")
     print(line)
     print(f"Key alias      : {info.get('key_alias') or '—'}")
-    print(f"User           : {info.get('user_id') or '—'}")
+    print(f"User / Owner   : {info.get('user_id') or '—'}")
     print(f"Team           : {info.get('team_id') or '—'}")
     print(f"Models allowed : {'all' if not models else ', '.join(models)}")
     print()
 
-    # ---------------- SPEND: this user's numbers ----------------
+    # ---------------- SPEND: this user's personal numbers ----------------
     print("------------------------ SPEND ------------------------")
     if my_cycle_spend is not None:
         pct = f" ({my_cycle_spend / gov_budget * 100:.1f}% of team budget)" if gov_budget else ""
         print(f"Cycle spend    : {money(my_cycle_spend)}{pct}")
     else:
-        # fall back to the key/governing spend if logs unavailable
         fallback = info.get("spend") if info.get("max_budget") is not None else team.get("spend")
         print(f"Cycle spend    : {money(fallback)}")
     if lifetime_spend is not None:
@@ -217,10 +239,8 @@ def main():
         reset = t.get("budget_reset_at")
         if cyc or reset:
             tleft = time_until(reset)
-            cyc_str = cyc or "—"
-            reset_str = f"{reset}" + (f" (in {tleft})" if tleft else "") if reset else "—"
-            print(f"      Cycle period : {cyc_str}")
-            print(f"      Resets       : {reset_str}")
+            print(f"      Cycle period : {cyc or '—'}")
+            print(f"      Resets       : " + (f"{reset}" + (f" (in {tleft})" if tleft else "") if reset else "—"))
     print()
     print(line)
 
