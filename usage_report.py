@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GenAI gateway usage report
+"""GenAI gateway usage report.
 Usage:
     python3 usage_report.py sk-your-api-key
     API_KEY=sk-your-api-key python3 usage_report.py
@@ -142,14 +142,14 @@ def main():
         tr = api_get(f"/team/info?team_id={key_team_id}", api_key)
         team = tr.get("team_info", tr) if "_error" not in tr else {}
     gov_budget = team.get("max_budget")
+    has_cycle = bool(team.get("budget_duration") or team.get("budget_reset_at"))
 
-    # ---- user info (team memberships + cached lifetime fallback) ----
+    # ---- user info (team memberships) ----
     user = {}
     if uid:
         ur = api_get(f"/user/info?user_id={uid}", api_key)
         user = ur if "_error" not in ur else {}
     user_info = user.get("user_info", user)
-    cached_lifetime = user_info.get("spend")
     created_at = user_info.get("created_at") or info.get("created_at")
 
     # ---- enumerate all the user's teams ----
@@ -168,19 +168,20 @@ def main():
         obj["resolved_team_id"] = tid
         teams.append(obj)
 
-    # ---- logs: ONE fetch, derive BOTH (lifetime >= cycle guaranteed) ----
+    # ---- logs: ONE fetch, derive BOTH personal figures (lifetime >= per-team) ----
     if uid:
         log_rows, logs_ok = fetch_user_logs(api_key, uid)
     else:
         log_rows, logs_ok = [], False
 
     if logs_ok:
+        # If the team has no cycle, since=None -> this becomes an all-time team sum.
         since = cycle_start(team.get("budget_reset_at"), team.get("budget_duration")) if key_team_id else None
-        my_cycle_spend = sum_logs(log_rows, team_id=key_team_id, since_dt=since)  # this team, this cycle
-        lifetime_spend = sum_logs(log_rows, team_id=None, since_dt=None)          # all teams, all time
+        my_team_spend = sum_logs(log_rows, team_id=key_team_id, since_dt=since)
+        lifetime_spend = sum_logs(log_rows, team_id=None, since_dt=None)
     else:
-        my_cycle_spend = None
-        lifetime_spend = cached_lifetime   # fallback if logs unavailable/timeout
+        my_team_spend = None
+        lifetime_spend = None
 
     models = info.get("models") or []
 
@@ -197,15 +198,20 @@ def main():
 
     # ---------------- SPEND: this user's personal numbers ----------------
     print("------------------------ SPEND ------------------------")
-    if my_cycle_spend is not None:
-        pct = f" ({my_cycle_spend / gov_budget * 100:.1f}% of team budget)" if gov_budget else ""
-        print(f"Cycle spend    : {money(my_cycle_spend)}{pct}")
+    if my_team_spend is not None:
+        pct = f" ({my_team_spend / gov_budget * 100:.1f}% of team budget)" if gov_budget else ""
+        if has_cycle:
+            print(f"Cycle spend    : {money(my_team_spend)}{pct}")
+        else:
+            print(f"Team spend     : {money(my_team_spend)}{pct}  [no budget cycle — all-time]")
     else:
-        fallback = info.get("spend") if info.get("max_budget") is not None else team.get("spend")
-        print(f"Cycle spend    : {money(fallback)}")
+        label = "Cycle spend" if has_cycle else "Team spend"
+        print(f"{label:<14} : unavailable (spend logs not accessible)")
     if lifetime_spend is not None:
         since_str = f" (since {str(created_at)[:10]})" if created_at else ""
         print(f"Lifetime spend : {money(lifetime_spend)}{since_str}")
+    else:
+        print("Lifetime spend : unavailable (spend logs not accessible)")
     print()
 
     # ---------------- TEAM BUDGETS: the team's numbers ----------------
@@ -232,6 +238,8 @@ def main():
             tleft = time_until(reset)
             print(f"      Cycle period : {cyc or '—'}")
             print(f"      Resets       : " + (f"{reset}" + (f" (in {tleft})" if tleft else "") if reset else "—"))
+        else:
+            print(f"      Cycle period : none (no reset)")
     print()
     print(line)
 
