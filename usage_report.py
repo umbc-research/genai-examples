@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""GenAI gateway usage report.
-
-SPEND section        -> this user's cycle spend (% of team budget) + lifetime spend
-TEAM BUDGETS section -> each team's budget, usage %, and cycle period
-
-Cycle spend and lifetime spend are both derived from a SINGLE /spend/logs fetch,
-so lifetime (all teams, all time) is always >= cycle (governing team, this cycle).
-Falls back to the cached /user/info counter if the logs endpoint is unavailable
-or times out.
-
+"""GenAI gateway usage report
 Usage:
     python3 usage_report.py sk-your-api-key
     API_KEY=sk-your-api-key python3 usage_report.py
@@ -199,7 +190,7 @@ def main():
     print("            GenAI Gateway — API Key Usage Report")
     print(line)
     print(f"Key alias      : {info.get('key_alias') or '—'}")
-    print(f"User / Owner   : {info.get('user_id') or '—'}")
+    print(f"User           : {info.get('user_id') or '—'}")
     print(f"Team           : {info.get('team_id') or '—'}")
     print(f"Models allowed : {'all' if not models else ', '.join(models)}")
     print()
