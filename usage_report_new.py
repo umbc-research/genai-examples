@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
 """GenAI gateway usage report.
-
-SPEND section          -> this user's personal spend (cycle / all-time) + lifetime
-KEY LIMITS section     -> this key's own budget, cycle period, and reset date
-TEAM BUDGETS section   -> each team's budget, usage %, cycle period, and reset
-
-Personal spend figures come from a SINGLE /spend/logs fetch (lifetime >= cycle).
-If /spend/logs is unavailable, personal figures are reported as "unavailable".
-
 Usage:
     python3 usage_report.py sk-your-api-key
     API_KEY=sk-your-api-key python3 usage_report.py
@@ -103,16 +95,19 @@ def fmt_reset(reset, cycle):
     """Build a 'Cycle period' + 'Resets' display tuple."""
     tleft = time_until(reset)
     cyc_str = cycle or "none (no reset)"
+
     if reset:
         reset_str = f"{reset}" + (f" (in {tleft})" if tleft else "")
     else:
         reset_str = "—"
+
     return cyc_str, reset_str
 
 
 # ----------------------------- spend from logs -----------------------------
 def fetch_user_logs(token, uid):
-    """Fetch this user's spend-log rows (single request). Returns (rows, ok)."""
+    """Fetch this user's spend-log rows (single request). Returns (rows, ok).
+       ok=False if the endpoint is unavailable/denied/times out."""
     resp = api_get(f"/spend/logs?user_id={uid}", token)
     if isinstance(resp, dict) and "_error" in resp:
         return [], False
@@ -154,7 +149,7 @@ def main():
     uid = info.get("user_id")
     key_team_id = info.get("team_id")
 
-    # ---- key-level (individual) budget fields ----
+    # ---- key-level budget fields ----
     key_budget = info.get("max_budget")
     key_spend = info.get("spend") or 0
     key_cycle = info.get("budget_duration")
@@ -192,13 +187,14 @@ def main():
         obj["resolved_team_id"] = tid
         teams.append(obj)
 
-    # ---- logs: ONE fetch, derive personal cycle + lifetime ----
+    # ---- logs: ONE fetch, derive BOTH personal figures (lifetime >= per-team) ----
     if uid:
         log_rows, logs_ok = fetch_user_logs(api_key, uid)
     else:
         log_rows, logs_ok = [], False
 
     if logs_ok:
+        # If the team has no cycle, since=None -> this becomes an all-time team sum.
         since = cycle_start(team.get("budget_reset_at"), team.get("budget_duration")) if key_team_id else None
         my_team_spend = sum_logs(log_rows, team_id=key_team_id, since_dt=since)
         lifetime_spend = sum_logs(log_rows, team_id=None, since_dt=None)
@@ -214,7 +210,7 @@ def main():
     print("            GenAI Gateway — API Key Usage Report")
     print(line)
     print(f"Key alias      : {info.get('key_alias') or '—'}")
-    print(f"User / Owner   : {info.get('user_id') or '—'}")
+    print(f"User           : {info.get('user_id') or '—'}")
     print(f"Team           : {info.get('team_id') or '—'}")
     print(f"Models allowed : {'all' if not models else ', '.join(models)}")
     print()
@@ -237,30 +233,86 @@ def main():
         print("Lifetime spend : unavailable (spend logs not accessible)")
     print()
 
-    # ---------------- KEY LIMITS: this key's own (individual) budget ----------------
-    print("--------------------- KEY LIMITS ----------------------")
-    print(f"Key spend      : {money(key_spend)}")
-    if key_budget is not None:
-        kpct = (key_spend / key_budget * 100) if key_budget else 0
-        print(f"Key budget     : ${key_budget} ({kpct:.1f}% used)")
-        print(f"Key remaining  : {money(key_budget - key_spend)}")
-        kcyc, kreset = fmt_reset(key_reset, key_cycle)
-        print(f"Cycle period   : {kcyc}")
-        print(f"Resets         : {kreset}")
-    else:
-        print(f"Key budget     : unlimited (no individual limit)")
-    print()
-
-    # ---------------- TEAM BUDGETS: the team's numbers ----------------
+    # --------------------- TEAM BUDGETS --------------------
     print("--------------------- TEAM BUDGETS --------------------")
+
     if not teams:
         print("  (no team budgets — usage is key- or user-managed)")
+
     for t in teams:
         tid = t.get("resolved_team_id")
-        gov = "  ← governs this key" if tid == key_team_id else ""
         name = t.get("team_alias") or tid or "—"
         tbudget = t.get("max_budget")
         tspend = t.get("spend") or 0
+
+        gov = "  ← governs this key" if tid == key_team_id else ""
+
+        print(f"  • {name}{gov}")
+
+        if tbudget is not None:
+            tpct = (tspend / tbudget * 100) if tbudget else 0
+
+            print(f"      Budget       : ${tbudget}")
+            print(f"      Team usage   : {money2(tspend)} ({tpct:.1f}%)")
+            print(f"      Remaining    : {money2(tbudget - tspend)}")
+
+        else:
+            print("      Budget       : unlimited")
+            print(f"      Team usage   : {money2(tspend)}")
+
+        cyc = t.get("budget_duration")
+        reset = t.get("budget_reset_at")
+
+        if cyc or reset:
+            tleft = time_until(reset)
+
+            print(f"      Cycle period : {cyc or '—'}")
+
+            print(
+                f"      Resets       : "
+                + (
+                    f"{reset}" + (f" (in {tleft})" if tleft else "")
+                    if reset else "—"
+                )
+            )
+
+            tstart = cycle_start(reset, cyc)
+            if tstart:
+                print(f"      Cycle start  : {tstart.isoformat()}")
+
+        else:
+            print("      Cycle period : none (no reset)")
+
+    print()
+    print(line)
+
+    # --------------------- KEY LIMITS ----------------------
+    print("--------------------- KEY LIMITS ----------------------")
+    print(f"Key spend      : {money(key_spend)}")
+
+    if key_budget is not None:
+        kpct = (key_spend / key_budget * 100) if key_budget else 0
+
+        print(f"Key budget     : ${key_budget}")
+        print(f"Key usage      : {money2(key_spend)} ({kpct:.1f}%)")
+        print(f"Key remaining  : {money(key_budget - key_spend)}")
+
+        kcyc, kreset = fmt_reset(key_reset, key_cycle)
+
+        print(f"Cycle period   : {kcyc}")
+        print(f"Resets         : {kreset}")
+
+        kstart = cycle_start(key_reset, key_cycle)
+        if kstart:
+            print(f"Cycle start    : {kstart.isoformat()}")
+
+    else:
+        print("Key budget     : unlimited")
+        print(f"Key usage      : {money2(key_spend)}")
+        print("Cycle period   : none (no reset)")
+
+    print()
+
 
 if __name__ == "__main__":
     main()
