@@ -55,15 +55,33 @@ def to_dt(s):
 
 
 def parse_duration(d):
-    """'7d'/'24h'/'30m' -> timedelta, or None."""
     if not d:
         return None
+    # bare integer/float -> treat as days
+    if isinstance(d, (int, float)):
+        return timedelta(days=int(d))
+    s = str(d)
+    # numeric string with no unit -> treat as days
+    if s.isdigit():
+        return timedelta(days=int(s))
     try:
-        n, unit = int(str(d)[:-1]), str(d)[-1]
+        n, unit = int(s[:-1]), s[-1]
     except (ValueError, IndexError):
         return None
     return {"d": timedelta(days=n), "h": timedelta(hours=n),
             "m": timedelta(minutes=n), "s": timedelta(seconds=n)}.get(unit)
+
+
+def fmt_duration(d):
+    """Normalize a duration value to a display string."""
+    if d is None:
+        return None
+    if isinstance(d, (int, float)):
+        return f"{int(d)}d"
+    s = str(d)
+    if s.isdigit():
+        return f"{s}d"
+    return s
 
 
 def time_until(reset_raw):
@@ -89,6 +107,19 @@ def cycle_start(reset_raw, duration):
     if end and dur:
         return end - dur
     return None
+
+
+def fmt_reset(reset, cycle):
+    """Build a 'Cycle period' + 'Resets' display tuple."""
+    tleft = time_until(reset)
+    cyc_str = fmt_duration(cycle) or "none (no reset)"
+
+    if reset:
+        reset_str = f"{reset}" + (f" (in {tleft})" if tleft else "")
+    else:
+        reset_str = "—"
+
+    return cyc_str, reset_str
 
 
 # ----------------------------- spend from logs -----------------------------
@@ -119,6 +150,17 @@ def sum_logs(rows, team_id=None, since_dt=None):
     return total
 
 
+# ----------------------------- member budget lookup -----------------------------
+def find_member_budget(team, uid):
+    def member_budget_from_team(team):
+        bt = team.get("team_member_budget_table") or {}
+        if isinstance(bt, dict) and bt:
+            return (
+                bt.get("max_budget"),
+                bt.get("budget_duration"),
+                bt.get("budget_reset_at"),
+           )
+    return (None, None, None)
 # ------------------------------- main -------------------------------
 def main():
     api_key = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("API_KEY")
@@ -136,6 +178,12 @@ def main():
     uid = info.get("user_id")
     key_team_id = info.get("team_id")
 
+    # ---- key-level budget fields (typically all null; real limit is per-member) ----
+    key_budget = info.get("max_budget")
+    key_spend = info.get("spend") or 0
+    key_cycle = info.get("budget_duration")
+    key_reset = info.get("budget_reset_at")
+
     # ---- governing team ----
     team = {}
     if key_team_id:
@@ -143,6 +191,20 @@ def main():
         team = tr.get("team_info", tr) if "_error" not in tr else {}
     gov_budget = team.get("max_budget")
     has_cycle = bool(team.get("budget_duration") or team.get("budget_reset_at"))
+
+    # ---- team-member budget ----
+    member_bt = team.get("team_member_budget_table") or {}
+    if isinstance(member_bt, dict) and member_bt.get("max_budget") is not None:
+        key_budget = member_bt.get("max_budget")
+        key_cycle = member_bt.get("budget_duration")
+        key_reset = member_bt.get("budget_reset_at")
+    else:
+        if key_budget is None:
+            key_budget = team.get("max_budget")
+        if key_cycle is None:
+            key_cycle = team.get("budget_duration")
+        if key_reset is None:
+            key_reset = team.get("budget_reset_at")
 
     # ---- user info (team memberships) ----
     user = {}
@@ -214,35 +276,86 @@ def main():
         print("Lifetime spend : unavailable (spend logs not accessible)")
     print()
 
-    # ---------------- TEAM BUDGETS: the team's numbers ----------------
+    # --------------------- TEAM BUDGETS --------------------
     print("--------------------- TEAM BUDGETS --------------------")
+
     if not teams:
         print("  (no team budgets — usage is key- or user-managed)")
+
     for t in teams:
         tid = t.get("resolved_team_id")
         name = t.get("team_alias") or tid or "—"
-        tbudget = t.get("max_budget")
+        tbudget = t.get("max_budget") 
         tspend = t.get("spend") or 0
+
         gov = "  ← governs this key" if tid == key_team_id else ""
+
         print(f"  • {name}{gov}")
+
         if tbudget is not None:
             tpct = (tspend / tbudget * 100) if tbudget else 0
+
             print(f"      Budget       : ${tbudget}")
             print(f"      Team usage   : {money2(tspend)} ({tpct:.1f}%)")
+            print(f"      Remaining    : {money2(tbudget - tspend)}")
+
         else:
-            print(f"      Budget       : unlimited")
+            print("      Budget        : unlimited")
             print(f"      Team usage   : {money2(tspend)}")
+
         cyc = t.get("budget_duration")
         reset = t.get("budget_reset_at")
+
         if cyc or reset:
             tleft = time_until(reset)
+
             print(f"      Cycle period : {cyc or '—'}")
-            print(f"      Resets       : " + (f"{reset}" + (f" (in {tleft})" if tleft else "") if reset else "—"))
+
+            print(
+                f"      Resets       : "
+                + (
+                    f"{reset}" + (f" (in {tleft})" if tleft else "")
+                    if reset else "—"
+                )
+            )
+
+            tstart = cycle_start(reset, cyc)
+            if tstart:
+                print(f"      Cycle start  : {tstart.isoformat()}")
+
         else:
-            print(f"      Cycle period : none (no reset)")
+            print("      Cycle period : none (no reset)")
+
     print()
     print(line)
 
+    # --------------------- TEAM MEMBER LIMITS ----------------------
+    print("--------------------- TEAM MEMBER LIMITS ----------------------")
+    print(f"Member spend            : {money(key_spend)}")
+
+    # 1. Print Budget Info
+    if key_budget is not None:
+        kpct = (key_spend / key_budget * 100) if key_budget else 0
+        print(f"Member budget           : ${key_budget}")
+        print(f"Member usage            : {money2(key_spend)} ({kpct:.1f}%)")
+        print(f"Member remaining budget : {money(key_budget - key_spend)}")
+    else:
+        print("Member budget           : unlimited")
+        print(f"Member usage            : {money2(key_spend)}")
+
+    # 2. Print Cycle and Reset Info (Independent of whether budget is unlimited)
+    if key_cycle or key_reset:
+        kcyc, kreset = fmt_reset(key_reset, key_cycle)
+        print(f"Cycle period            : {kcyc}")
+        print(f"Resets                  : {kreset}")
+
+        kstart = cycle_start(key_reset, key_cycle)
+        if kstart:
+            print(f"Cycle start             : {kstart.isoformat()}")
+    else:
+        print("Cycle period            : none (no reset)")
+
+    print()
 
 if __name__ == "__main__":
     main()
