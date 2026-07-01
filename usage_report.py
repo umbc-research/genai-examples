@@ -99,18 +99,27 @@ def time_until(reset_raw):
         return f"{h}h {m}m"
     return f"{m}m"
 
-
 def cycle_start(reset_raw, duration):
-    """Start of current budget cycle = reset_at - duration, or None."""
     end = to_dt(reset_raw)
     dur = parse_duration(duration)
     if end and dur:
         return end - dur
     return None
 
+def cycle_start_floor(reset_raw):
+    """Start of current budget cycle = reset_at - duration, or None."""
+    end = to_dt(reset_raw)
+    if end is None:
+        return None
+    month = end.month - 1
+    year = end.year
+    if month == 0:
+        month = 12
+        year -= 1
+    return end.replace(year=year, month=month, day=1, hour=0, minute=0, second=0, microsecond=0)
+
 
 def fmt_reset(reset, cycle):
-    """Build a 'Cycle period' + 'Resets' display tuple."""
     tleft = time_until(reset)
     cyc_str = fmt_duration(cycle) or "none (no reset)"
 
@@ -121,6 +130,12 @@ def fmt_reset(reset, cycle):
 
     return cyc_str, reset_str
 
+def cycle_days_member(reset_raw):
+    end = to_dt(reset_raw)
+    start = cycle_start_floor(reset_raw)
+    if end and start:
+        return (end - start).days
+    return None
 
 # ----------------------------- spend from logs -----------------------------
 def fetch_user_logs(token, uid):
@@ -237,8 +252,9 @@ def main():
         log_rows, logs_ok = [], False
 
     if logs_ok:
-        # If the team has no cycle, since=None -> this becomes an all-time team sum.
-        since = cycle_start(team.get("budget_reset_at"), team.get("budget_duration")) if key_team_id else None
+        since = cycle_start_floor(key_reset) if key_reset else None
+        if since and since > datetime.now(tz=timezone.utc):
+            since = None
         my_team_spend = sum_logs(log_rows, team_id=key_team_id, since_dt=since)
         lifetime_spend = sum_logs(log_rows, team_id=None, since_dt=None)
     else:
@@ -331,25 +347,30 @@ def main():
 
     # --------------------- TEAM MEMBER LIMITS ----------------------
     print("--------------------- TEAM MEMBER LIMITS ----------------------")
-    print(f"Member spend            : {money(key_spend)}")
-
+    display_spend = my_team_spend if my_team_spend is not None else key_spend
+    
     # 1. Print Budget Info
     if key_budget is not None:
-        kpct = (key_spend / key_budget * 100) if key_budget else 0
+        kpct = (display_spend / key_budget * 100) if key_budget else 0
+        print(f"Member spend            : {money(key_spend)}")
         print(f"Member budget           : ${key_budget}")
-        print(f"Member usage            : {money2(key_spend)} ({kpct:.1f}%)")
-        print(f"Member remaining budget : {money(key_budget - key_spend)}")
+        print(f"Member usage            : {money2(display_spend)} ({kpct:.1f}%)")
+        print(f"Member remaining budget : {money(key_budget - display_spend)}")
     else:
+        print(f"Member spend            : {money(key_spend)}")
         print("Member budget           : unlimited")
-        print(f"Member usage            : {money2(key_spend)}")
+        print(f"Member usage            : {money2(display_spend)}")
 
     # 2. Print Cycle and Reset Info (Independent of whether budget is unlimited)
     if key_cycle or key_reset:
-        kcyc, kreset = fmt_reset(key_reset, key_cycle)
+        monthly_cycle = cycle_days_member(key_reset)
+        kcyc = f"{monthly_cycle}d" if monthly_cycle else (fmt_reset(key_reset, key_cycle) or "none (no reset)")
+        _, kreset = fmt_reset(key_reset, key_cycle)
+
         print(f"Cycle period            : {kcyc}")
         print(f"Resets                  : {kreset}")
 
-        kstart = cycle_start(key_reset, key_cycle)
+        kstart = cycle_start_floor(key_reset)
         if kstart:
             print(f"Cycle start             : {kstart.isoformat()}")
     else:
