@@ -252,13 +252,16 @@ def main():
         log_rows, logs_ok = [], False
 
     if logs_ok:
+        team_since = cycle_start(team.get("budget_reset_at"), team.get("budget_duration")) if key_team_id else None
+        my_team_spend = sum_logs(log_rows, team_id=key_team_id, since_dt=team_since)
         since = cycle_start_floor(key_reset) if key_reset else None
         if since and since > datetime.now(tz=timezone.utc):
             since = None
-        my_team_spend = sum_logs(log_rows, team_id=key_team_id, since_dt=since)
+        my_member_spend = sum_logs(log_rows, team_id=key_team_id, since_dt=since)
         lifetime_spend = sum_logs(log_rows, team_id=None, since_dt=None)
     else:
         my_team_spend = None
+        my_member_spend = None
         lifetime_spend = None
 
     models = info.get("models") or []
@@ -347,7 +350,7 @@ def main():
 
     # --------------------- TEAM MEMBER LIMITS ----------------------
     print("--------------------- TEAM MEMBER LIMITS ----------------------")
-    display_spend = my_team_spend if my_team_spend is not None else key_spend
+    display_spend = my_member_spend if my_member_spend is not None else key_spend
     
     # 1. Print Budget Info
     if key_budget is not None:
