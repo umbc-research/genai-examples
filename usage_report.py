@@ -33,12 +33,7 @@ def api_get(path, token, timeout=15):
 
 # ----------------------------- formatting helpers -----------------------------
 def money(v):
-    return f"${(v or 0):.4f}"
-
-
-def money2(v):
     return f"${(v or 0):.2f}"
-
 
 def to_dt(s):
     """Parse epoch number or ISO string -> aware UTC datetime, or None."""
@@ -282,15 +277,15 @@ def main():
     if my_team_spend is not None:
         pct = f" ({my_team_spend / gov_budget * 100:.1f}% of team budget)" if gov_budget else ""
         if has_cycle:
-            print(f"Cycle spend    : {money(my_team_spend)}{pct}")
+            print(f"Cycle spend    : {money(my_team_spend)}{pct}  [personal spend per current team cycle]")
         else:
-            print(f"Team spend     : {money(my_team_spend)}{pct}  [no budget cycle — all-time]")
+            print(f"Team spend     : {money(my_team_spend)}{pct}  [no budget cycle - all-time]")
     else:
         label = "Cycle spend" if has_cycle else "Team spend"
         print(f"{label:<14} : unavailable (spend logs not accessible)")
     if lifetime_spend is not None:
         since_str = f" (since {str(created_at)[:10]})" if created_at else ""
-        print(f"Lifetime spend : {money(lifetime_spend)}{since_str}")
+        print(f"Lifetime spend : {money(lifetime_spend)}{since_str}  [all user keys - all-time]")
     else:
         print("Lifetime spend : unavailable (spend logs not accessible)")
     print()
@@ -314,13 +309,13 @@ def main():
         if tbudget is not None:
             tpct = (tspend / tbudget * 100) if tbudget else 0
 
-            print(f"      Budget       : ${tbudget}")
-            print(f"      Team usage   : {money2(tspend)} ({tpct:.1f}%)")
-            print(f"      Remaining    : {money2(tbudget - tspend)}")
+            print(f"      Budget       : {money(tbudget)}")
+            print(f"      Team usage   : {money(tspend)} [whole team current cycle spend]")
+            print(f"      Remaining    : {money(tbudget - tspend)}")
 
         else:
             print("      Budget        : unlimited")
-            print(f"      Team usage   : {money2(tspend)}")
+            print(f"      Team usage   : {money(tspend)}")
 
         cyc = t.get("budget_duration")
         reset = t.get("budget_reset_at")
@@ -355,14 +350,14 @@ def main():
     # 1. Print Budget Info
     if key_budget is not None:
         kpct = (display_spend / key_budget * 100) if key_budget else 0
-        print(f"Member spend            : {money(key_spend)}")
-        print(f"Member budget           : ${key_budget}")
-        print(f"Member usage            : {money2(display_spend)} ({kpct:.1f}%)")
+        print(f"Member spend            : {money(key_spend)} [current personal key - all-time]")
+        print(f"Member budget           : {money(key_budget)}")
+        print(f"Member usage            : {money(display_spend)} [current personal key cycle spend]")
         print(f"Member remaining budget : {money(key_budget - display_spend)}")
     else:
         print(f"Member spend            : {money(key_spend)}")
         print("Member budget           : unlimited")
-        print(f"Member usage            : {money2(display_spend)}")
+        print(f"Member usage            : {money(display_spend)}")
 
     # 2. Print Cycle and Reset Info (Independent of whether budget is unlimited)
     if key_cycle or key_reset:
