@@ -1,7 +1,1 @@
-# About
-test
-# Examples
-
-## Checking Usage
-<Spencer>
-
+Scripts for Open WebUI/LiteLLM
