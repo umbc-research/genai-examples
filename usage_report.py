@@ -6,6 +6,7 @@ Usage:
 """
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -159,6 +160,55 @@ def sum_logs(rows, team_id=None, since_dt=None):
         total += r.get("spend", 0) or 0
     return total
 
+def sum_logs_by_model(rows, team_id=None, since_dt=None):
+    """Sum spend per model, optionally filtered by team_id and/or since_dt."""
+    totals = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if team_id is not None and r.get("team_id") != team_id:
+            continue
+        ts = to_dt(r.get("startTime") or r.get("created_at") or r.get("timestamp"))
+        if since_dt and ts and ts < since_dt:
+            continue
+        model = r.get("model") or "unknown"
+        if not model or str(model).lower == "unknown":
+            continue
+        totals[model] = totals.get(model, 0.0) + (r.get("spend", 0) or 0)
+    return totals
+
+def normalize_model_name(name):
+    """Map friendly aliases and variant names to a single canonical ID."""
+    if not name:
+        return name
+    n = name.lower().strip()
+    # Strip bedrock prefix
+    if n.startswith("bedrock/"):
+        n = n[len("bedrock/"):]
+    # Strip AWS region prefix
+    for prefix in ("us.", "eu.", "ap."):
+        if n.startswith(prefix):
+            n = n[len(prefix):]
+    # Strip anthropic vendor prefix
+    if n.startswith("anthropic."):
+        n = n[len("anthropic."):]
+    # Strip trailing version/date suffixes like -20251001-v1:0 or -v1
+    n = re.sub(r"-\d{8}-v\d+(?::\d+)?$", "", n)
+    n = re.sub(r"-v\d+(?::\d+)?$", "", n)
+    # Normalize spaces and dots to hyphens so "claude sonnet 4.6"
+    # and "claude-sonnet-4-6" both become "claude-sonnet-4-6"
+    n = n.replace(" ", "-").replace(".", "-")
+    # Collapse any double hyphens produced by substitution
+    n = re.sub(r"-+", "-", n)
+    return n
+
+def merge_by_canonical(spend_dict):
+    """Consolidate spend entries that map to the same canonical model name."""
+    merged = {}
+    for model, spend in spend_dict.items():
+        canonical = normalize_model_name(model)
+        merged[canonical] = merged.get(canonical, 0.0) + spend
+    return merged
 
 # ----------------------------- member budget lookup -----------------------------
 def find_member_budget(team, uid):
@@ -187,6 +237,10 @@ def main():
     info = key_resp.get("info", {})
     uid = info.get("user_id")
     key_team_id = info.get("team_id")
+
+    # ---- available models ----
+    models_resp = api_get("/v1/models", api_key)
+    available_models = [m.get("id") for m in (models_resp.get("data") or []) if m.get("id")]
 
     # ---- key-level budget fields (typically all null; real limit is per-member) ----
     key_budget = info.get("max_budget")
@@ -254,11 +308,14 @@ def main():
             since = None
         my_member_spend = sum_logs(log_rows, team_id=key_team_id, since_dt=since)
         lifetime_spend = sum_logs(log_rows, team_id=None, since_dt=None)
+        model_cycle_spend    = merge_by_canonical(sum_logs_by_model(log_rows, team_id=key_team_id, since_dt=since))
+        model_lifetime_spend = merge_by_canonical(sum_logs_by_model(log_rows, team_id=None, since_dt=None))
     else:
         my_team_spend = None
         my_member_spend = None
         lifetime_spend = None
-
+        model_cycle_spend = {}
+        model_lifetime_spend = {}
     models = info.get("models") or []
 
     # ============================ render ============================
@@ -341,7 +398,6 @@ def main():
             print("      Cycle period : none (no reset)")
 
     print()
-    print(line)
 
     # --------------------- TEAM MEMBER LIMITS ----------------------
     print("--------------------- TEAM MEMBER LIMITS ----------------------")
@@ -374,6 +430,29 @@ def main():
     else:
         print("Cycle period            : none (no reset)")
 
+    print()
+
+    #---------------INDIVIDUAL MODEL USAGE---------------
+    print("--------------------- MODEL USAGE ----------------------")
+    print("  (Your accessible models and spend for this key)")
+    print()
+
+    available_models_normalized = {normalize_model_name(m) for m in available_models}
+
+    # Show all accessible models, even those with $0.00 spend
+    all_models_to_show = set(normalize_model_name(m) for m in available_models) | set(model_cycle_spend) | set(model_lifetime_spend)
+
+    if not all_models_to_show:
+        print("  No model usage data available.")
+    else:
+        for model in sorted(all_models_to_show):
+            if model.lower() == "unknown":
+                continue
+            cycle_val   = model_cycle_spend.get(model, 0.0)
+            lifetime_val = model_lifetime_spend.get(model, 0.0) 
+            print(f"  - {model}")
+            print(f"        Cycle spend   : {money(cycle_val)}")
+            print(f"        Lifetime spend: {money(lifetime_val)}")
     print()
 
 if __name__ == "__main__":
