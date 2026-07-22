@@ -114,24 +114,29 @@ def cycle_start_floor(reset_raw):
         year -= 1
     return end.replace(year=year, month=month, day=1, hour=0, minute=0, second=0, microsecond=0)
 
-
-def fmt_reset(reset, cycle):
-    tleft = time_until(reset)
-    cyc_str = fmt_duration(cycle) or "none (no reset)"
-
-    if reset:
-        reset_str = f"{reset}" + (f" (in {tleft})" if tleft else "")
-    else:
-        reset_str = "—"
-
-    return cyc_str, reset_str
-
 def cycle_days_member(reset_raw):
     end = to_dt(reset_raw)
     start = cycle_start_floor(reset_raw)
     if end and start:
         return (end - start).days
     return None
+
+def next_month_first(reset_raw):
+    """Given any reset timestamp, return the correct reset date normalized
+    to the 1st of the month (00:00 UTC) that the budget cycle should use."""
+    end = to_dt(reset_raw)
+    if end is None:
+        return None
+    # If the given reset isn't already exactly the 1st, roll forward to the
+    # next 1st-of-month so displayed resets always land on a month boundary.
+    if end.day == 1 and end.hour == 0 and end.minute == 0 and end.second == 0:
+        return end
+    month = end.month + 1
+    year = end.year
+    if month == 13:
+        month = 1
+        year += 1
+    return end.replace(year=year, month=month, day=1, hour=0, minute=0, second=0, microsecond=0)
 
 # ----------------------------- spend from logs -----------------------------
 def fetch_user_logs(token, uid):
@@ -210,17 +215,6 @@ def merge_by_canonical(spend_dict):
         merged[canonical] = merged.get(canonical, 0.0) + spend
     return merged
 
-# ----------------------------- member budget lookup -----------------------------
-def find_member_budget(team, uid):
-    def member_budget_from_team(team):
-        bt = team.get("team_member_budget_table") or {}
-        if isinstance(bt, dict) and bt:
-            return (
-                bt.get("max_budget"),
-                bt.get("budget_duration"),
-                bt.get("budget_reset_at"),
-           )
-    return (None, None, None)
 # ------------------------------- main -------------------------------
 def main():
     api_key = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("API_KEY")
@@ -258,13 +252,12 @@ def main():
 
     # ---- team-member budget ----
     member_bt = team.get("team_member_budget_table") or {}
-    if isinstance(member_bt, dict) and member_bt.get("max_budget") is not None:
+    if key_budget is None and isinstance(member_bt, dict) and member_bt.get("max_budget") is not None:
         key_budget = member_bt.get("max_budget")
         key_cycle = member_bt.get("budget_duration")
         key_reset = member_bt.get("budget_reset_at")
-    else:
-        if key_budget is None:
-            key_budget = team.get("max_budget")
+    elif key_budget is None:
+        key_budget = team.get("max_budget")
         if key_cycle is None:
             key_cycle = team.get("budget_duration")
         if key_reset is None:
@@ -303,7 +296,8 @@ def main():
     if logs_ok:
         team_since = cycle_start(team.get("budget_reset_at"), team.get("budget_duration")) if key_team_id else None
         my_team_spend = sum_logs(log_rows, team_id=key_team_id, since_dt=team_since)
-        since = cycle_start_floor(key_reset) if key_reset else None
+        correct_reset = next_month_first(key_reset) if key_reset else None
+        since = cycle_start_floor(correct_reset) if key_reset else None
         if since and since > datetime.now(tz=timezone.utc):
             since = None
         my_member_spend = sum_logs(log_rows, team_id=key_team_id, since_dt=since)
@@ -417,14 +411,17 @@ def main():
 
     # 2. Print Cycle and Reset Info (Independent of whether budget is unlimited)
     if key_cycle or key_reset:
-        monthly_cycle = cycle_days_member(key_reset)
-        kcyc = f"{monthly_cycle}d" if monthly_cycle else (fmt_reset(key_reset, key_cycle) or "none (no reset)")
-        _, kreset = fmt_reset(key_reset, key_cycle)
+        correct_reset = next_month_first(key_reset)
+        monthly_cycle = cycle_days_member(correct_reset) if correct_reset else None
+        kcyc = f"{monthly_cycle}d" if monthly_cycle else (fmt_duration(key_cycle) or "none (no reset)")
+
+        tleft = time_until(correct_reset)
+        kreset = f"{correct_reset.isoformat()}" + (f" (in {tleft})" if tleft else "") if correct_reset else "—"
 
         print(f"Cycle period            : {kcyc}")
         print(f"Resets                  : {kreset}")
 
-        kstart = cycle_start_floor(key_reset)
+        kstart = cycle_start_floor(correct_reset)
         if kstart:
             print(f"Cycle start             : {kstart.isoformat()}")
     else:
@@ -436,8 +433,6 @@ def main():
     print("--------------------- MODEL USAGE ----------------------")
     print("  (Your accessible models and spend for this key)")
     print()
-
-    available_models_normalized = {normalize_model_name(m) for m in available_models}
 
     # Show all accessible models, even those with $0.00 spend
     all_models_to_show = set(normalize_model_name(m) for m in available_models) | set(model_cycle_spend) | set(model_lifetime_spend)
