@@ -277,7 +277,8 @@ def main():
                 key_cycle = user_info.get("budget_duration")
             if key_reset is None:
                 key_reset = user_info.get("budget_reset_at")
-    # ---- per-member budget from /team/{team_id}/members/me ----
+                
+    # ---- per-member budget ----
     if key_team_id:
         member_resp = api_get(f"/team/{key_team_id}/members/me", api_key)
         if "_error" not in member_resp and isinstance(member_resp, dict):
