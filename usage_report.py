@@ -230,6 +230,7 @@ def main():
 
     info = key_resp.get("info", {})
     uid = info.get("user_id")
+    user_email = info.get("user_email") or info.get("email")
     key_team_id = info.get("team_id")
 
     # ---- available models ----
@@ -252,10 +253,10 @@ def main():
 
     # ---- team-member budget ----
     member_bt = team.get("team_member_budget_table") or {}
-    if key_budget is None and isinstance(member_bt, dict) and member_bt.get("max_budget") is not None:
+    if isinstance(member_bt, dict) and member_bt.get("max_budget") is not None:
         key_budget = member_bt.get("max_budget")
-        key_cycle = member_bt.get("budget_duration")
-        key_reset = member_bt.get("budget_reset_at")
+        key_cycle = member_bt.get("budget_duration") or member_bt.get("duration")
+        key_reset = member_bt.get("budget_reset_at") or member_bt.get("reset_at")
     elif key_budget is None:
         key_budget = team.get("max_budget")
         if key_cycle is None:
@@ -268,8 +269,23 @@ def main():
     if uid:
         ur = api_get(f"/user/info?user_id={uid}", api_key)
         user = ur if "_error" not in ur else {}
-    user_info = user.get("user_info", user)
-    created_at = user_info.get("created_at") or info.get("created_at")
+        user_info = user.get("user_info", user)
+        created_at = user_info.get("created_at") or info.get("created_at")
+        if user_info.get("max_budget") is not None:
+            key_budget = user_info.get("max_budget")
+            if key_cycle is None:
+                key_cycle = user_info.get("budget_duration")
+            if key_reset is None:
+                key_reset = user_info.get("budget_reset_at")
+    # ---- per-member budget from /team/{team_id}/members/me ----
+    if key_team_id:
+        member_resp = api_get(f"/team/{key_team_id}/members/me", api_key)
+        if "_error" not in member_resp and isinstance(member_resp, dict):
+            member_lt = member_resp.get("litellm_budget_table") or {}
+            if member_lt.get("max_budget") is not None:
+                key_budget = member_lt.get("max_budget")
+                key_cycle = member_lt.get("budget_duration") or key_cycle
+                key_reset = member_lt.get("budget_reset_at") or key_reset
 
     # ---- enumerate all the user's teams ----
     team_ids = set()
@@ -431,10 +447,9 @@ def main():
 
     #---------------INDIVIDUAL MODEL USAGE---------------
     print("--------------------- MODEL USAGE ----------------------")
-    print("  (Your accessible models and spend for this key)")
+    print("  (Models used by key)")
     print()
 
-    # Show all accessible models, even those with $0.00 spend
     all_models_to_show = set(normalize_model_name(m) for m in available_models) | set(model_cycle_spend) | set(model_lifetime_spend)
 
     if not all_models_to_show:
@@ -444,7 +459,9 @@ def main():
             if model.lower() == "unknown":
                 continue
             cycle_val   = model_cycle_spend.get(model, 0.0)
-            lifetime_val = model_lifetime_spend.get(model, 0.0) 
+            lifetime_val = model_lifetime_spend.get(model, 0.0)
+            if cycle_val == 0 and lifetime_val == 0:
+                continue 
             print(f"  - {model}")
             print(f"        Cycle spend   : {money(cycle_val)}")
             print(f"        Lifetime spend: {money(lifetime_val)}")
