@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
-"""GenAI gateway usage report.
-Usage:
-    python3 usage_report.py sk-your-api-key
-    API_KEY=sk-your-api-key python3 usage_report.py
-"""
+"GenAI gateway usage report"
+
 import json
 import os
 import re
@@ -218,8 +215,22 @@ def merge_by_canonical(spend_dict):
 # ------------------------------- main -------------------------------
 def main():
     api_key = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("API_KEY")
-    if not api_key:
-        sys.exit("Usage: usage_report.py sk-your-api-key   (or set API_KEY env var)")
+    if not api_key or sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        print("")
+        print("Options:")
+        print("  -h, --help       Show this help message and exit")
+        print("")
+        print("Description:")
+        print("  Tracks Open WebUI/LiteLLM budget usage for users")
+        print("")
+        print("Environment variables (optional):")
+        print("  API_KEY          Your gateway API key (alternative to passing as argument)")
+        print("")
+        print("Examples:")
+        print("  python3 report.py sk-your-api-key")
+        print("  API_KEY=sk-your-api-key python3 report.py")
+        sys.exit(0 if sys.argv[1] in ("-h", "--help") else 1)
 
     # ---- key info ----
     key_resp = api_get(f"/key/info?key={api_key}", api_key)
@@ -277,8 +288,7 @@ def main():
                 key_cycle = user_info.get("budget_duration")
             if key_reset is None:
                 key_reset = user_info.get("budget_reset_at")
-                
-    # ---- per-member budget ----
+    # ---- per-member budget from /team/{team_id}/members/me ----
     if key_team_id:
         member_resp = api_get(f"/team/{key_team_id}/members/me", api_key)
         if "_error" not in member_resp and isinstance(member_resp, dict):
@@ -350,12 +360,12 @@ def main():
             print(f"Team spend     : {money(my_team_spend)}{pct}  [no budget cycle - all-time]")
     else:
         label = "Cycle spend" if has_cycle else "Team spend"
-        print(f"{label:<14} : unavailable (spend logs not accessible)")
+        print(f"{label:<14} : spend logs not accessible (run the script again)")
     if lifetime_spend is not None:
         since_str = f" (since {str(created_at)[:10]})" if created_at else ""
         print(f"Lifetime spend : {money(lifetime_spend)}{since_str}  [all user keys - all-time]")
     else:
-        print("Lifetime spend : unavailable (spend logs not accessible)")
+        print("Lifetime spend : spend logs not accessible (run the script again)")
     print()
 
     # --------------------- TEAM BUDGETS --------------------
