@@ -316,7 +316,12 @@ def main():
 
     # ---- logs: ONE fetch, derive BOTH personal figures (lifetime >= per-team) ----
     if uid:
-        log_rows, logs_ok = fetch_user_logs(api_key, uid)
+        log_rows, logs_ok = [], False
+        for attempt in range(3):
+            log_rows, logs_ok = fetch_user_logs(api_key, uid)
+            if logs_ok:
+                break
+            time.sleep(2)
     else:
         log_rows, logs_ok = [], False
 
