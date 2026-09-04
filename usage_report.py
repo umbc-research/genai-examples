@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"GenAI gateway usage report"
+"""GenAI gateway usage report"""
 
 import json
 import os
 import re
-import socket
 import sys
 import time
 import urllib.request
@@ -22,8 +21,8 @@ def api_get(path, token, timeout=15):
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
-        return {"_error": f"HTTP {e.code}: {e.read().decode()[:200]}"}
-    except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+        return {"_error": f"HTTP {e.code}: {e.read().decode()[:200]}", "path": path}
+    except (urllib.error.URLError, TimeoutError) as e:
         return {"_error": f"timeout/connection error: {e}"}
     except json.JSONDecodeError:
         return {"_error": "non-JSON response"}
@@ -34,7 +33,6 @@ def money(v):
     return f"${(v or 0):.2f}"
 
 def to_dt(s):
-    """Parse epoch number or ISO string -> aware UTC datetime, or None."""
     if s is None:
         return None
     if isinstance(s, (int, float)):
@@ -46,27 +44,7 @@ def to_dt(s):
     except ValueError:
         return None
 
-
-def parse_duration(d):
-    if not d:
-        return None
-    # bare integer/float -> treat as days
-    if isinstance(d, (int, float)):
-        return timedelta(days=int(d))
-    s = str(d)
-    # numeric string with no unit -> treat as days
-    if s.isdigit():
-        return timedelta(days=int(s))
-    try:
-        n, unit = int(s[:-1]), s[-1]
-    except (ValueError, IndexError):
-        return None
-    return {"d": timedelta(days=n), "h": timedelta(hours=n),
-            "m": timedelta(minutes=n), "s": timedelta(seconds=n)}.get(unit)
-
-
 def fmt_duration(d):
-    """Normalize a duration value to a display string."""
     if d is None:
         return None
     if isinstance(d, (int, float)):
@@ -76,9 +54,22 @@ def fmt_duration(d):
         return f"{s}d"
     return s
 
+def parse_duration(d):
+    if not d:
+        return None
+    if isinstance(d, (int, float)):
+        return timedelta(days=int(d))
+    s = str(d)
+    if s.isdigit():
+        return timedelta(days=int(s))
+    try:
+        n, unit = int(s[:-1]), s[-1]
+    except (ValueError, IndexError):
+        return None
+    return {"d": timedelta(days=n), "h": timedelta(hours=n),
+            "m": timedelta(minutes=n), "s": timedelta(seconds=n)}.get(unit)
 
 def time_until(reset_raw):
-    """'Xd Yh' / 'Yh Zm' / 'Zm' until reset, or None."""
     target = to_dt(reset_raw)
     if target is None:
         return None
@@ -100,7 +91,6 @@ def cycle_start(reset_raw, duration):
     return None
 
 def cycle_start_floor(reset_raw):
-    """Start of current budget cycle = reset_at - duration, or None."""
     end = to_dt(reset_raw)
     if end is None:
         return None
@@ -109,7 +99,8 @@ def cycle_start_floor(reset_raw):
     if month == 0:
         month = 12
         year -= 1
-    return end.replace(year=year, month=month, day=1, hour=0, minute=0, second=0, microsecond=0)
+    return end.replace(year=year, month=month, day=1, hour=0, minute=0,
+                       second=0, microsecond=0)
 
 def cycle_days_member(reset_raw):
     end = to_dt(reset_raw)
@@ -119,13 +110,9 @@ def cycle_days_member(reset_raw):
     return None
 
 def next_month_first(reset_raw):
-    """Given any reset timestamp, return the correct reset date normalized
-    to the 1st of the month (00:00 UTC) that the budget cycle should use."""
     end = to_dt(reset_raw)
     if end is None:
         return None
-    # If the given reset isn't already exactly the 1st, roll forward to the
-    # next 1st-of-month so displayed resets always land on a month boundary.
     if end.day == 1 and end.hour == 0 and end.minute == 0 and end.second == 0:
         return end
     month = end.month + 1
@@ -133,12 +120,35 @@ def next_month_first(reset_raw):
     if month == 13:
         month = 1
         year += 1
-    return end.replace(year=year, month=month, day=1, hour=0, minute=0, second=0, microsecond=0)
+    return end.replace(year=year, month=month, day=1, hour=0, minute=0,
+                       second=0, microsecond=0)
 
-# ----------------------------- spend from logs -----------------------------
+def normalize_model_name(name):
+    if not name:
+        return name
+    n = name.lower().strip()
+    if n.startswith("bedrock/"):
+        n = n[len("bedrock/"):]
+    for prefix in ("us.", "eu.", "ap."):
+        if n.startswith(prefix):
+            n = n[len(prefix):]
+    if n.startswith("anthropic."):
+        n = n[len("anthropic."):]
+    n = re.sub(r"-\d{8}-v\d+(?::\d+)?$", "", n)
+    n = re.sub(r"-v\d+(?::\d+)?$", "", n)
+    n = n.replace(" ", "-").replace(".", "-")
+    n = re.sub(r"-+", "-", n)
+    return n
+
+def merge_by_canonical(spend_dict):
+    merged = {}
+    for model, spend in spend_dict.items():
+        merged[normalize_model_name(model)] = merged.get(normalize_model_name(model), 0.0) + spend
+    return merged
+
+
+# ----------------------------- spend via /spend/logs (original fallback) -----------------------------
 def fetch_user_logs(token, uid):
-    """Fetch this user's spend-log rows (single request). Returns (rows, ok).
-       ok=False if the endpoint is unavailable/denied/times out."""
     resp = api_get(f"/spend/logs?user_id={uid}", token)
     if isinstance(resp, dict) and "_error" in resp:
         return [], False
@@ -147,9 +157,7 @@ def fetch_user_logs(token, uid):
         return [], False
     return rows, True
 
-
 def sum_logs(rows, team_id=None, since_dt=None):
-    """Sum spend in rows, optionally filtered by team_id and/or since_dt."""
     total = 0.0
     for r in rows:
         if not isinstance(r, dict):
@@ -163,7 +171,6 @@ def sum_logs(rows, team_id=None, since_dt=None):
     return total
 
 def sum_logs_by_model(rows, team_id=None, since_dt=None):
-    """Sum spend per model, optionally filtered by team_id and/or since_dt."""
     totals = {}
     for r in rows:
         if not isinstance(r, dict):
@@ -179,55 +186,32 @@ def sum_logs_by_model(rows, team_id=None, since_dt=None):
         totals[model] = totals.get(model, 0.0) + (r.get("spend", 0) or 0)
     return totals
 
-def normalize_model_name(name):
-    """Map friendly aliases and variant names to a single canonical ID."""
-    if not name:
-        return name
-    n = name.lower().strip()
-    # Strip bedrock prefix
-    if n.startswith("bedrock/"):
-        n = n[len("bedrock/"):]
-    # Strip AWS region prefix
-    for prefix in ("us.", "eu.", "ap."):
-        if n.startswith(prefix):
-            n = n[len(prefix):]
-    # Strip anthropic vendor prefix
-    if n.startswith("anthropic."):
-        n = n[len("anthropic."):]
-    # Strip trailing version/date suffixes like -20251001-v1:0 or -v1
-    n = re.sub(r"-\d{8}-v\d+(?::\d+)?$", "", n)
-    n = re.sub(r"-v\d+(?::\d+)?$", "", n)
-    # Normalize spaces and dots to hyphens so "claude sonnet 4.6"
-    # and "claude-sonnet-4-6" both become "claude-sonnet-4-6"
-    n = n.replace(" ", "-").replace(".", "-")
-    # Collapse any double hyphens produced by substitution
-    n = re.sub(r"-+", "-", n)
-    return n
 
-def merge_by_canonical(spend_dict):
-    """Consolidate spend entries that map to the same canonical model name."""
-    merged = {}
-    for model, spend in spend_dict.items():
-        canonical = normalize_model_name(model)
-        merged[canonical] = merged.get(canonical, 0.0) + spend
-    return merged
+# ----------------------------- spend via /spend/report (new, if available) -----------------------------
+def spend_report(token, **params):
+    qs = "&".join(f"{k}={v}" for k, v in params.items() if v is not None)
+    resp = api_get(f"/spend/report?{qs}", token)
+    if isinstance(resp, dict) and "_error" in resp:
+        return [], False
+    rows = resp if isinstance(resp, list) else resp.get("data", resp.get("results", []))
+    return (rows if isinstance(rows, list) else []), True
+
+def total_from_report(rows):
+    return sum(r.get("total_spend") or r.get("spend") or r.get("total") or 0 for r in rows)
+
 
 # ------------------------------- main -------------------------------
 def main():
     api_key = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("API_KEY")
     if not api_key or sys.argv[1] in ("-h", "--help"):
         print(__doc__)
-        print("")
-        print("Options:")
+        print("\nOptions:")
         print("  -h, --help       Show this help message and exit")
-        print("")
-        print("Description:")
+        print("\nDescription:")
         print("  Tracks Open WebUI/LiteLLM budget usage for users")
-        print("")
-        print("Environment variables (optional):")
+        print("\nEnvironment variables (optional):")
         print("  API_KEY          Your gateway API key (alternative to passing as argument)")
-        print("")
-        print("Examples:")
+        print("\nExamples:")
         print("  python3 report.py sk-your-api-key")
         print("  API_KEY=sk-your-api-key python3 report.py")
         sys.exit(0 if sys.argv[1] in ("-h", "--help") else 1)
@@ -243,108 +227,124 @@ def main():
     uid = info.get("user_id")
     user_email = info.get("user_email") or info.get("email")
     key_team_id = info.get("team_id")
+    key_spend = info.get("spend") or 0
+    created_at = info.get("created_at")
+    if uid:
+        ur = api_get(f"/user/info?user_id={uid}", api_key)
+        user = ur if "_error" not in ur else {}
+        user_info = user.get("user_info", user)
+        created_at = user_info.get("created_at") or created_at
 
     # ---- available models ----
     models_resp = api_get("/v1/models", api_key)
     available_models = [m.get("id") for m in (models_resp.get("data") or []) if m.get("id")]
 
-    # ---- key-level budget fields (typically all null; real limit is per-member) ----
-    key_budget = info.get("max_budget")
-    key_spend = info.get("spend") or 0
-    key_cycle = info.get("budget_duration")
-    key_reset = info.get("budget_reset_at")
-
-    # ---- governing team ----
+    # ---- governing team: try /v2/team/info, fall back to /team/info ----
     team = {}
+    gov_budget = None
+    has_cycle = False
     if key_team_id:
-        tr = api_get(f"/team/info?team_id={key_team_id}", api_key)
+        tr = api_get(f"/v2/team/info?team_id={key_team_id}", api_key)
+        if "_error" in tr:
+            tr = api_get(f"/team/info?team_id={key_team_id}", api_key)
         team = tr.get("team_info", tr) if "_error" not in tr else {}
-    gov_budget = team.get("max_budget")
-    has_cycle = bool(team.get("budget_duration") or team.get("budget_reset_at"))
+        gov_budget = team.get("max_budget")
+        has_cycle = bool(team.get("budget_duration") or team.get("budget_reset_at"))
 
     # ---- team-member budget ----
     member_bt = team.get("team_member_budget_table") or {}
-    if isinstance(member_bt, dict) and member_bt.get("max_budget") is not None:
-        key_budget = member_bt.get("max_budget")
-        key_cycle = member_bt.get("budget_duration") or member_bt.get("duration")
-        key_reset = member_bt.get("budget_reset_at") or member_bt.get("reset_at")
-    elif key_budget is None:
+    if isinstance(member_bt, dict) and member_bt.get("max_budget") is None and key_team_id:
+        mr = api_get(f"/team/{key_team_id}/members/me", api_key)
+        if "_error" not in mr and isinstance(mr, dict):
+            member_bt = mr.get("litellm_budget_table") or {}
+    key_budget = member_bt.get("max_budget") if isinstance(member_bt, dict) else None
+    key_cycle = (member_bt.get("budget_duration") or member_bt.get("duration")) if isinstance(member_bt, dict) else None
+    key_reset = (member_bt.get("budget_reset_at") or member_bt.get("reset_at")) if isinstance(member_bt, dict) else None
+    if key_budget is None:
         key_budget = team.get("max_budget")
-        if key_cycle is None:
-            key_cycle = team.get("budget_duration")
-        if key_reset is None:
-            key_reset = team.get("budget_reset_at")
+    if key_cycle is None:
+        key_cycle = team.get("budget_duration")
+    if key_reset is None:
+        key_reset = team.get("budget_reset_at")
 
-    # ---- user info (team memberships) ----
-    user = {}
-    if uid:
-        ur = api_get(f"/user/info?user_id={uid}", api_key)
-        user = ur if "_error" not in ur else {}
-        user_info = user.get("user_info", user)
-        created_at = user_info.get("created_at") or info.get("created_at")
-        if user_info.get("max_budget") is not None:
-            key_budget = user_info.get("max_budget")
-            if key_cycle is None:
-                key_cycle = user_info.get("budget_duration")
-            if key_reset is None:
-                key_reset = user_info.get("budget_reset_at")
-    # ---- per-member budget from /team/{team_id}/members/me ----
-    if key_team_id:
-        member_resp = api_get(f"/team/{key_team_id}/members/me", api_key)
-        if "_error" not in member_resp and isinstance(member_resp, dict):
-            member_lt = member_resp.get("litellm_budget_table") or {}
-            if member_lt.get("max_budget") is not None:
-                key_budget = member_lt.get("max_budget")
-                key_cycle = member_lt.get("budget_duration") or key_cycle
-                key_reset = member_lt.get("budget_reset_at") or key_reset
-
-    # ---- enumerate all the user's teams ----
-    team_ids = set()
-    for src in (user.get("teams") or []), (user.get("user_info", {}).get("teams") or []):
-        for t in src:
-            tid = t.get("team_id") if isinstance(t, dict) else t
-            if tid:
-                team_ids.add(tid)
-    if key_team_id:
-        team_ids.add(key_team_id)
+    # ---- enumerate teams: try /v2/team/list (or /team/list) once ----
+    team_ids = set([key_team_id] if key_team_id else [])
     teams = []
-    for tid in sorted(team_ids):
-        tr = api_get(f"/team/info?team_id={tid}", api_key)
-        obj = tr.get("team_info", tr) if "_error" not in tr else {}
-        obj["resolved_team_id"] = tid
-        teams.append(obj)
+    teams_resp = api_get("/v2/team/list", api_key)
+    if "_error" in teams_resp:
+        teams_resp = api_get("/team/list", api_key)
+    if "_error" not in teams_resp:
+        for t in (teams_resp.get("data") or teams_resp.get("teams") or []):
+            if isinstance(t, dict):
+                t["resolved_team_id"] = t.get("team_id")
+                teams.append(t)
+    # fallback: loop per team id (original behaviour)
+    if not teams:
+        for tid in sorted(team_ids):
+            tr = api_get(f"/team/info?team_id={tid}", api_key)
+            obj = tr.get("team_info", tr) if "_error" not in tr else {}
+            obj["resolved_team_id"] = tid
+            teams.append(obj)
 
-    # ---- logs: ONE fetch, derive BOTH personal figures (lifetime >= per-team) ----
-    if uid:
+    # ---- compute the cycle window once ----
+    correct_reset = next_month_first(key_reset) if key_reset else None
+    since = cycle_start_floor(correct_reset) if correct_reset else None
+    if since and since > datetime.now(tz=timezone.utc):
+        since = None
+    team_since = cycle_start(team.get("budget_reset_at"), team.get("budget_duration")) if key_team_id else None
+
+    # ---- spend: prefer /spend/report, fall back to /spend/logs ----
+    my_team_spend = my_member_spend = lifetime_spend = None
+    model_cycle_spend = {}
+    model_lifetime_spend = {}
+
+    report, r_ok = spend_report(api_key)
+    if r_ok and report:
+        # server did the grouping; lifetime = total of all rows
+        lifetime_spend = total_from_report(report)
+        # per-model lifetime: group by 'model' key if present
+        by_model = {}
+        for r in report:
+            mdl = r.get("model") or r.get("model_id")
+            if mdl:
+                by_model[mdl] = by_model.get(mdl, 0.0) + (r.get("total_spend") or r.get("spend") or r.get("total") or 0)
+        model_lifetime_spend = merge_by_canonical(by_model)
+
+        # member / team cycle spend: request with team_id filter + start_date if supported
+        if key_team_id:
+            start_s = since.strftime("%Y-%m-%d") if since else None
+            cyc_report, c_ok = spend_report(api_key, team_id=key_team_id, start_date=start_s)
+            if c_ok:
+                my_member_spend = total_from_report(cyc_report)
+                c_by_model = {}
+                for r in cyc_report:
+                    mdl = r.get("model") or r.get("model_id")
+                    if mdl:
+                        c_by_model[mdl] = c_by_model.get(mdl, 0.0) + (r.get("total_spend") or r.get("spend") or r.get("total") or 0)
+                model_cycle_spend = merge_by_canonical(c_by_model)
+            # team cycle spend: report without start_date = current cycle by team
+            my_team_spend = my_member_spend
+        else:
+            my_team_spend = my_member_spend = lifetime_spend
+
+    if my_member_spend is None and uid:
+        # ---- fallback: original /spend/logs + local summing ----
         log_rows, logs_ok = [], False
-        for attempt in range(3):
+        for _ in range(3):
             log_rows, logs_ok = fetch_user_logs(api_key, uid)
             if logs_ok:
                 break
             time.sleep(2)
-    else:
-        log_rows, logs_ok = [], False
+        if logs_ok:
+            my_team_spend = sum_logs(log_rows, team_id=key_team_id, since_dt=team_since)
+            my_member_spend = sum_logs(log_rows, team_id=key_team_id, since_dt=since)
+            lifetime_spend = sum_logs(log_rows, team_id=None, since_dt=None)
+            model_cycle_spend = merge_by_canonical(sum_logs_by_model(log_rows, team_id=key_team_id, since_dt=since))
+            model_lifetime_spend = merge_by_canonical(sum_logs_by_model(log_rows, team_id=None, since_dt=None))
 
-    if logs_ok:
-        team_since = cycle_start(team.get("budget_reset_at"), team.get("budget_duration")) if key_team_id else None
-        my_team_spend = sum_logs(log_rows, team_id=key_team_id, since_dt=team_since)
-        correct_reset = next_month_first(key_reset) if key_reset else None
-        since = cycle_start_floor(correct_reset) if key_reset else None
-        if since and since > datetime.now(tz=timezone.utc):
-            since = None
-        my_member_spend = sum_logs(log_rows, team_id=key_team_id, since_dt=since)
-        lifetime_spend = sum_logs(log_rows, team_id=None, since_dt=None)
-        model_cycle_spend    = merge_by_canonical(sum_logs_by_model(log_rows, team_id=key_team_id, since_dt=since))
-        model_lifetime_spend = merge_by_canonical(sum_logs_by_model(log_rows, team_id=None, since_dt=None))
-    else:
-        my_team_spend = None
-        my_member_spend = None
-        lifetime_spend = None
-        model_cycle_spend = {}
-        model_lifetime_spend = {}
     models = info.get("models") or []
 
-    # ============================ render ============================
+    # ============================ render (identical to original) ============================
     line = "=" * 55
     print(line)
     print("            GenAI Gateway — API Key Usage Report")
@@ -355,7 +355,6 @@ def main():
     print(f"Models allowed : {'all' if not models else ', '.join(models)}")
     print()
 
-    # ---------------- SPEND: this user's personal numbers ----------------
     print("------------------------ SPEND ------------------------")
     if my_team_spend is not None:
         pct = f" ({my_team_spend / gov_budget * 100:.1f}% of team budget)" if gov_budget else ""
@@ -373,63 +372,42 @@ def main():
         print("Lifetime spend : spend logs not accessible (run the script again)")
     print()
 
-    # --------------------- TEAM BUDGETS --------------------
     print("--------------------- TEAM BUDGETS --------------------")
-
     if not teams:
         print("  (no team budgets — usage is key- or user-managed)")
-
     for t in teams:
         tid = t.get("resolved_team_id")
         name = t.get("team_alias") or tid or "—"
-        tbudget = t.get("max_budget") 
+        tbudget = t.get("max_budget")
         tspend = t.get("spend") or 0
-
         gov = "  ← governs this key" if tid == key_team_id else ""
-
         print(f"  • {name}{gov}")
-
         if tbudget is not None:
             tpct = (tspend / tbudget * 100) if tbudget else 0
-
             print(f"      Budget       : {money(tbudget)}")
             print(f"      Team usage   : {money(tspend)} [whole team current cycle spend]")
             print(f"      Remaining    : {money(tbudget - tspend)}")
-
         else:
             print("      Budget        : unlimited")
             print(f"      Team usage   : {money(tspend)}")
-
         cyc = t.get("budget_duration")
         reset = t.get("budget_reset_at")
-
         if cyc or reset:
             tleft = time_until(reset)
-
             print(f"      Cycle period : {cyc or '—'}")
-
             print(
                 f"      Resets       : "
-                + (
-                    f"{reset}" + (f" (in {tleft})" if tleft else "")
-                    if reset else "—"
-                )
+                + (f"{reset}" + (f" (in {tleft})" if tleft else "") if reset else "—")
             )
-
             tstart = cycle_start(reset, cyc)
             if tstart:
                 print(f"      Cycle start  : {tstart.isoformat()}")
-
         else:
             print("      Cycle period : none (no reset)")
-
     print()
 
-    # --------------------- TEAM MEMBER LIMITS ----------------------
     print("--------------------- TEAM MEMBER LIMITS ----------------------")
     display_spend = my_member_spend if my_member_spend is not None else key_spend
-    
-    # 1. Print Budget Info
     if key_budget is not None:
         kpct = (display_spend / key_budget * 100) if key_budget else 0
         print(f"Member spend            : {money(key_spend)} [current personal key - all-time]")
@@ -440,48 +418,40 @@ def main():
         print(f"Member spend            : {money(key_spend)}")
         print("Member budget           : unlimited")
         print(f"Member usage            : {money(display_spend)}")
-
-    # 2. Print Cycle and Reset Info (Independent of whether budget is unlimited)
     if key_cycle or key_reset:
         correct_reset = next_month_first(key_reset)
         monthly_cycle = cycle_days_member(correct_reset) if correct_reset else None
         kcyc = f"{monthly_cycle}d" if monthly_cycle else (fmt_duration(key_cycle) or "none (no reset)")
-
         tleft = time_until(correct_reset)
         kreset = f"{correct_reset.isoformat()}" + (f" (in {tleft})" if tleft else "") if correct_reset else "—"
-
         print(f"Cycle period            : {kcyc}")
         print(f"Resets                  : {kreset}")
-
         kstart = cycle_start_floor(correct_reset)
         if kstart:
             print(f"Cycle start             : {kstart.isoformat()}")
     else:
         print("Cycle period            : none (no reset)")
-
     print()
 
-    #---------------INDIVIDUAL MODEL USAGE---------------
     print("--------------------- MODEL USAGE ----------------------")
     print("  (Models used by key)")
     print()
-
     all_models_to_show = set(normalize_model_name(m) for m in available_models) | set(model_cycle_spend) | set(model_lifetime_spend)
-
     if not all_models_to_show:
         print("  No model usage data available.")
     else:
         for model in sorted(all_models_to_show):
             if model.lower() == "unknown":
                 continue
-            cycle_val   = model_cycle_spend.get(model, 0.0)
+            cycle_val = model_cycle_spend.get(model, 0.0)
             lifetime_val = model_lifetime_spend.get(model, 0.0)
             if cycle_val == 0 and lifetime_val == 0:
-                continue 
+                continue
             print(f"  - {model}")
             print(f"        Cycle spend   : {money(cycle_val)}")
             print(f"        Lifetime spend: {money(lifetime_val)}")
     print()
+
 
 if __name__ == "__main__":
     main()
